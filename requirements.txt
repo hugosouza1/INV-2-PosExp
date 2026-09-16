@@ -1,0 +1,8 @@
+huggingface_hub
+numpy
+pandas
+pyarrow
+opencv-python
+mediapipe
+torch
+pytest

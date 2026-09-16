@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.claude/
+
+# dataset bruto/processado - grande demais para o git (9GB+, contém
+# arquivos de video acima do limite de 100MB do GitHub)
+dataset/
+
+# modelo do MediaPipe baixado automaticamente por landmark_extractor.py
+# na primeira execucao (nao faz parte do codigo do projeto)
+pipeline/feature_extraction/models/
