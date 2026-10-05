@@ -10,9 +10,17 @@ Só orquestra os contratos públicos de `preprocessing` e
 `feature_extraction` — não depende de nenhum detalhe interno desses
 módulos.
 
+Suporta consumir vídeos que não foram baixados: com `stream=True`, pra
+todo `video_id` sem arquivo local em `videos/`, lê diretamente da URL
+do Hugging Face (`hf_hub_url`) via streaming HTTP do OpenCV/FFmpeg —
+sem salvar o `.mp4` em disco. Evita ter que baixar o dataset inteiro
+(~800 vídeos) só pra rodar a etapa [3]; o único artefato persistido por
+vídeo é o `.parquet` de landmarks, bem menor que o vídeo original.
+
 Uso:
     python -m libras_pipeline.feature_extraction.build_dataset_features \
-        --dataset-dir dataset/minds-libras --output-dir dataset/features
+        --dataset-dir dataset/minds-libras --output-dir dataset/features \
+        [--stream] [--repo ibmectech/minds-libras-raw]
 """
 
 from __future__ import annotations
@@ -29,6 +37,24 @@ from pipeline.feature_extraction.landmark_extractor import (
 )
 from pipeline.preprocessing.video_preprocessor import PreprocessConfig, extract_frames
 
+DEFAULT_REPO_ID = "ibmectech/minds-libras-raw"
+
+
+def resolve_video_source(
+    dataset_dir: Path, video_filename: str, stream: bool, repo_id: str
+) -> str | Path | None:
+    """Caminho local se o vídeo já foi baixado; senão, com `stream=True`,
+    a URL direta do repositório no Hugging Face (lida sob demanda pelo
+    OpenCV, sem download prévio); senão, `None` (vídeo indisponível)."""
+    local_path = dataset_dir / "videos" / video_filename
+    if local_path.exists():
+        return local_path
+    if stream:
+        from huggingface_hub import hf_hub_url
+
+        return hf_hub_url(repo_id=repo_id, repo_type="dataset", filename=f"videos/{video_filename}")
+    return None
+
 
 def build_dataset_features(
     dataset_dir: str | Path,
@@ -36,6 +62,8 @@ def build_dataset_features(
     preprocess_config: PreprocessConfig | None = None,
     landmark_config: LandmarkExtractionConfig | None = None,
     overwrite: bool = False,
+    stream: bool = False,
+    repo_id: str = DEFAULT_REPO_ID,
 ) -> list[Path]:
     dataset_dir = Path(dataset_dir)
     output_dir = Path(output_dir)
@@ -51,9 +79,6 @@ def build_dataset_features(
         signer_id = str(row["user_id"])
 
         video_filename = video_id if video_id.endswith(".mp4") else f"{video_id}.mp4"
-        video_path = dataset_dir / "videos" / video_filename
-        if not video_path.exists():
-            continue
 
         # Idempotente: se o job for interrompido (rede caiu, processo
         # morto etc.), rodar de novo só processa o que falta.
@@ -62,7 +87,15 @@ def build_dataset_features(
             generated.append(existing_path)
             continue
 
-        frames = extract_frames(video_path, preprocess_config)
+        video_source = resolve_video_source(dataset_dir, video_filename, stream, repo_id)
+        if video_source is None:
+            continue
+
+        try:
+            frames = extract_frames(video_source, preprocess_config)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"  [AVISO] falha lendo {video_filename} ({exc}); pulando.")
+            continue
         sequence = extract_landmarks(frames, landmark_config)
         out_path = save_landmark_sequence(
             video_id=video_id,
@@ -86,10 +119,20 @@ def main():
     parser.add_argument(
         "--overwrite", action="store_true", help="Reprocessa vídeos que já têm .parquet salvo"
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Pra vídeos sem arquivo local, lê direto da URL do Hugging Face (sem baixar)",
+    )
+    parser.add_argument("--repo", default=DEFAULT_REPO_ID, help="Repositório do dataset no Hugging Face")
     args = parser.parse_args()
 
     generated = build_dataset_features(
-        Path(args.dataset_dir), Path(args.output_dir), overwrite=args.overwrite
+        Path(args.dataset_dir),
+        Path(args.output_dir),
+        overwrite=args.overwrite,
+        stream=args.stream,
+        repo_id=args.repo,
     )
     print(f"\nConcluído. {len(generated)} sequências de features salvas em {args.output_dir}")
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import numpy as np
@@ -70,6 +71,12 @@ FACE_SEMANTIC_LANDMARK_INDICES: tuple[int, ...] = (
 NUM_FACE_LANDMARKS_REDUCED = len(FACE_SEMANTIC_LANDMARK_INDICES)
 FACE_DIM_REDUCED = NUM_FACE_LANDMARKS_REDUCED * 3  # x, y, z
 
+# Índices dos ombros no modelo de pose do MediaPipe (iguais entre a API
+# legada e a Tasks API — `vision.PoseLandmark.LEFT_SHOULDER`/`RIGHT_SHOULDER`).
+# Usados como referência pra normalização corporal dos landmarks.
+LEFT_SHOULDER_IDX = 11
+RIGHT_SHOULDER_IDX = 12
+
 
 @dataclass
 class LandmarkExtractionConfig:
@@ -81,6 +88,13 @@ class LandmarkExtractionConfig:
     face_mode: str = "reduced"
     min_detection_confidence: float = 0.5
     min_landmarks_confidence: float = 0.5
+    # Centraliza todos os landmarks (pose/mãos/rosto) no ponto médio dos
+    # ombros e escala pela largura dos ombros, antes de montar o vetor de
+    # features. Sem isso, as coordenadas são absolutas em tela — o modelo
+    # aprende a distância/posição do sinalizador em relação à câmera e o
+    # porte físico dele, em vez do movimento do sinal, o que generaliza mal
+    # pra sinalizadores novos (ver leave-one-signer-out em `model/train.py`).
+    normalize_landmarks: bool = True
 
     @property
     def face_dim(self) -> int:
@@ -145,21 +159,71 @@ def _flatten_by_indices(
     return vec
 
 
+def _body_center_scale(pose_landmarks: Sequence[Any] | None) -> tuple[tuple[float, float, float], float]:
+    """Centro (ponto médio dos ombros) e escala (largura dos ombros) pra
+    normalizar os landmarks num referencial centrado no corpo do
+    sinalizador. Sem ombros detectados, usa um referencial neutro
+    (centro da imagem, escala 1) — os landmarks ficam como vieram."""
+    if not pose_landmarks or len(pose_landmarks) <= RIGHT_SHOULDER_IDX:
+        return (0.5, 0.5, 0.0), 1.0
+
+    left = pose_landmarks[LEFT_SHOULDER_IDX]
+    right = pose_landmarks[RIGHT_SHOULDER_IDX]
+    center = ((left.x + right.x) / 2.0, (left.y + right.y) / 2.0, (left.z + right.z) / 2.0)
+    scale = float(np.hypot(left.x - right.x, left.y - right.y))
+    if scale < 1e-6:
+        scale = 1.0
+    return center, scale
+
+
+def _normalize_points(
+    landmarks: Sequence[Any] | None, center: tuple[float, float, float], scale: float
+) -> Sequence[Any] | None:
+    """Reexpressa cada landmark em `(x,y,z)` relativo a `center`, escalado
+    por `scale`; preserva `visibility` quando presente. Lista vazia/None
+    passa direto (`_flatten`/`_flatten_by_indices` já tratam isso como
+    "nada detectado" e preenchem zeros)."""
+    if not landmarks:
+        return landmarks
+    cx, cy, cz = center
+    return [
+        SimpleNamespace(
+            x=(lm.x - cx) / scale,
+            y=(lm.y - cy) / scale,
+            z=(lm.z - cz) / scale,
+            visibility=getattr(lm, "visibility", None),
+        )
+        for lm in landmarks
+    ]
+
+
 def result_to_feature_vector(result: Any, config: LandmarkExtractionConfig) -> np.ndarray:
     """Converte um `HolisticLandmarkerResult` (ou qualquer objeto com os
     mesmos atributos) num único vetor de features pro frame."""
+    pose_landmarks = result.pose_landmarks
+    left_hand_landmarks = result.left_hand_landmarks
+    right_hand_landmarks = result.right_hand_landmarks
+    face_landmarks = result.face_landmarks
+
+    if config.normalize_landmarks:
+        center, scale = _body_center_scale(pose_landmarks)
+        pose_landmarks = _normalize_points(pose_landmarks, center, scale)
+        left_hand_landmarks = _normalize_points(left_hand_landmarks, center, scale)
+        right_hand_landmarks = _normalize_points(right_hand_landmarks, center, scale)
+        face_landmarks = _normalize_points(face_landmarks, center, scale)
+
     parts = [
-        _flatten(result.pose_landmarks, NUM_POSE_LANDMARKS, include_visibility=True),
-        _flatten(result.left_hand_landmarks, NUM_HAND_LANDMARKS, include_visibility=False),
-        _flatten(result.right_hand_landmarks, NUM_HAND_LANDMARKS, include_visibility=False),
+        _flatten(pose_landmarks, NUM_POSE_LANDMARKS, include_visibility=True),
+        _flatten(left_hand_landmarks, NUM_HAND_LANDMARKS, include_visibility=False),
+        _flatten(right_hand_landmarks, NUM_HAND_LANDMARKS, include_visibility=False),
     ]
     if config.include_face:
         if config.face_mode == "reduced":
             parts.append(
-                _flatten_by_indices(result.face_landmarks, FACE_SEMANTIC_LANDMARK_INDICES, include_visibility=False)
+                _flatten_by_indices(face_landmarks, FACE_SEMANTIC_LANDMARK_INDICES, include_visibility=False)
             )
         else:
-            parts.append(_flatten(result.face_landmarks, NUM_FACE_LANDMARKS_FULL, include_visibility=False))
+            parts.append(_flatten(face_landmarks, NUM_FACE_LANDMARKS_FULL, include_visibility=False))
     return np.concatenate(parts)
 
 
