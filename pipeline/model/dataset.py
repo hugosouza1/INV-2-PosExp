@@ -57,16 +57,25 @@ def leave_one_signer_out_splits(
 
 
 class SignSequenceDataset(Dataset):
-    def __init__(self, samples: list[SignSample], label_to_idx: dict[str, int]):
+    def __init__(self, samples: list[SignSample], label_to_idx: dict[str, int], augment: bool = False):
+        """augment=True aplica jitter temporal/espacial leve (ver
+        pipeline/model/augmentation.py) a cada amostra, a cada época —
+        usar SÓ no dataset de treino, nunca no de teste/avaliação."""
         self.samples = samples
         self.label_to_idx = label_to_idx
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         sample = self.samples[idx]
-        sequence = torch.from_numpy(sample.sequence.astype(np.float32))
+        seq = sample.sequence
+        if self.augment:
+            from pipeline.model.augmentation import augment_sequence
+
+            seq = augment_sequence(seq)
+        sequence = torch.from_numpy(seq.astype(np.float32))
         return sequence, self.label_to_idx[sample.label]
 
 

@@ -63,15 +63,29 @@ class SignLSTMClassifier(nn.Module):
         return self.classifier(last)
 
 
-def save_checkpoint(model: SignLSTMClassifier, label_classes: list[str], path: str | Path) -> None:
+def save_checkpoint(
+    model: SignLSTMClassifier,
+    label_classes: list[str],
+    path: str | Path,
+    meta: dict | None = None,
+) -> None:
+    """`meta` guarda como o modelo foi treinado (ex.: frame_stride), pra a
+    inferência aplicar o mesmo pré-processamento sem depender de quem chama."""
     torch.save(
         {
             "config": model.config.__dict__,
             "state_dict": model.state_dict(),
             "label_classes": label_classes,
+            "meta": meta or {},
         },
         path,
     )
+
+
+def load_checkpoint_meta(path: str | Path, map_location: str = "cpu") -> dict:
+    """Metadados de treino do checkpoint ({} em checkpoints antigos, sem meta)."""
+    checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    return checkpoint.get("meta", {})
 
 
 def load_checkpoint(path: str | Path, map_location: str = "cpu") -> tuple[SignLSTMClassifier, list[str]]:
