@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from pipeline.model.classifier import load_checkpoint
+from pipeline.model.classifier import load_checkpoint, load_checkpoint_meta
 
 
 class SignPredictor:
@@ -23,9 +23,16 @@ class SignPredictor:
         self.model, self.label_classes = load_checkpoint(model_path, map_location=device)
         self.model.to(device)
         self.model.eval()
+        # Mesmo pré-processamento do treino: se o modelo foi treinado com
+        # 1 a cada N frames, a inferência tem que fazer o mesmo.
+        meta = load_checkpoint_meta(model_path, map_location=device)
+        self.frame_stride = max(1, int(meta.get("frame_stride", 1)))
 
     def predict(self, sequence: np.ndarray) -> tuple[str, float]:
-        """Recebe uma sequência (T, F) e devolve (rótulo previsto, confiança em [0, 1])."""
+        """Recebe uma sequência (T, F) e devolve (rótulo previsto, confiança em [0, 1]).
+        A subamostragem de frames do treino (frame_stride) é aplicada aqui."""
+        if self.frame_stride > 1:
+            sequence = sequence[:: self.frame_stride]
         tensor = torch.from_numpy(sequence.astype(np.float32)).unsqueeze(0).to(self.device)
         lengths = torch.tensor([tensor.shape[1]], dtype=torch.long)
         with torch.no_grad():

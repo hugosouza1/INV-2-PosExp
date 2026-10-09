@@ -2,13 +2,28 @@
 train.py
 =========
 Etapa [4] do pipeline (treino): treina o classificador de sinais sobre
-as sequências de landmarks extraídas pela etapa [3], validando com
-leave-one-signer-out (um fold por sinalizador, testado só nos vídeos
-dele e treinado em todos os outros).
+as sequências de landmarks extraídas pela etapa [3].
 
-Uso:
-    python -m libras_pipeline.model.train \
-        --features-dir dataset/features --output model.pt
+Duas fases distintas, de propósito separadas:
+
+1. Avaliação (leave-one-signer-out): mede generalização pra sinalizador
+   nunca visto — um fold por sinalizador, testado só nele e treinado em
+   todos os outros. Serve só pra medir, não gera o modelo de produção.
+2. Modelo final: treinado em 100% dos sinalizadores (sem deixar nenhum
+   de fora), usando os mesmos hiperparâmetros já validados na fase 1.
+   É esse que é salvo como o checkpoint de produção.
+
+(Antes, o checkpoint salvo era o de um único fold do LOSO — o que
+"acertou mais" num sinalizador específico, mas que nunca tinha visto
+esse mesmo sinalizador no treino. Não era o modelo mais bem treinado,
+era o mais bem avaliado num recorte. Separado conforme alinhado.)
+
+Uso (PowerShell, numa linha; só o modelo final, sem os 8 folds):
+    python -m pipeline.model.train --features-dir dataset/features_v2 --output model_v3_e100s2.pt --epochs 100 --frame-stride 2 --skip-eval
+
+--frame-stride N usa 1 a cada N frames (acelera ~N vezes sem perder
+acurácia nos testes) e fica gravado no checkpoint: o predict.py aplica o
+mesmo stride sozinho na inferência.
 """
 
 from __future__ import annotations
@@ -31,17 +46,25 @@ from pipeline.model.dataset import (
 )
 
 
+def apply_frame_stride(samples: list[SignSample], stride: int) -> None:
+    """Subamostra os frames de cada sequência (1 a cada `stride`), in-place."""
+    if stride > 1:
+        for s in samples:
+            s.sequence = s.sequence[::stride]
+
+
 def train_one_fold(
     samples: list[SignSample],
-    label_to_idx: dict[str, int],
+    label_to_idx: dict,
     train_idx: list[int],
     test_idx: list[int],
     epochs: int = 20,
     batch_size: int = 8,
     lr: float = 1e-3,
     device: str = "cpu",
+    augment: bool = False,
 ) -> tuple[SignLSTMClassifier, float]:
-    train_ds = SignSequenceDataset([samples[i] for i in train_idx], label_to_idx)
+    train_ds = SignSequenceDataset([samples[i] for i in train_idx], label_to_idx, augment=augment)
     test_ds = SignSequenceDataset([samples[i] for i in test_idx], label_to_idx)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_padded)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_padded)
@@ -53,7 +76,8 @@ def train_one_fold(
     criterion = nn.CrossEntropyLoss()
 
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        epoch_loss = 0.0
         for sequences, lengths, labels in train_loader:
             sequences, labels = sequences.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -61,6 +85,9 @@ def train_one_fold(
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+        if epoch == 0 or (epoch + 1) % 10 == 0:
+            print(f"    época {epoch + 1}/{epochs} loss={epoch_loss / len(train_loader):.4f}", flush=True)
 
     model.eval()
     correct, total = 0, 0
@@ -80,24 +107,49 @@ def train_leave_one_signer_out(
     batch_size: int = 8,
     lr: float = 1e-3,
     device: str = "cpu",
-) -> tuple[SignLSTMClassifier, dict[str, int], dict[str, float]]:
+    frame_stride: int = 1,
+    augment: bool = False,
+) -> tuple[dict[str, int], dict[str, float]]:
+    """Mede generalização pra sinalizador novo. NÃO devolve um modelo
+    de produção — só os números de acurácia por fold (ver
+    train_final_model para o modelo que de fato será salvo)."""
     samples = load_all_samples(features_dir)
+    apply_frame_stride(samples, frame_stride)
     label_to_idx = build_label_mapping(samples)
 
     fold_accuracies: dict[str, float] = {}
-    best_model, best_accuracy = None, -1.0
     for signer, train_idx, test_idx in leave_one_signer_out_splits(samples):
-        model, accuracy = train_one_fold(
-            samples, label_to_idx, train_idx, test_idx, epochs, batch_size, lr, device
+        _, accuracy = train_one_fold(
+            samples, label_to_idx, train_idx, test_idx, epochs, batch_size, lr, device, augment
         )
         fold_accuracies[signer] = accuracy
         print(f"[leave-one-signer-out] sinalizador de teste={signer} acc={accuracy:.3f}")
-        if accuracy > best_accuracy:
-            best_model, best_accuracy = model, accuracy
 
     mean_accuracy = sum(fold_accuracies.values()) / len(fold_accuracies)
-    print(f"Acurácia média (leave-one-signer-out): {mean_accuracy:.3f}")
-    return best_model, label_to_idx, fold_accuracies
+    print(f"Acurácia média de generalização (leave-one-signer-out): {mean_accuracy:.3f}")
+    return label_to_idx, fold_accuracies
+
+
+def train_final_model(
+    samples: list[SignSample],
+    label_to_idx: dict,
+    epochs: int = 20,
+    batch_size: int = 8,
+    lr: float = 1e-3,
+    device: str = "cpu",
+    augment: bool = False,
+) -> SignLSTMClassifier:
+    """Treina o modelo de produção usando TODOS os sinalizadores (sem
+    leave-one-out). Rodar depois de já ter validado a generalização via
+    train_leave_one_signer_out — aquele mede, esse é o que vai pra produção."""
+    all_idx = list(range(len(samples)))
+    # test_idx = train_idx só porque train_one_fold exige um test_loader;
+    # a "acurácia" retornada aqui é em cima dos próprios dados de treino
+    # e não tem significado de generalização — ignorada de propósito.
+    model, _ = train_one_fold(
+        samples, label_to_idx, all_idx, all_idx, epochs, batch_size, lr, device, augment
+    )
+    return model
 
 
 def main():
@@ -108,14 +160,46 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--frame-stride", type=int, default=1, help="Usa 1 a cada N frames (gravado no checkpoint)")
+    parser.add_argument("--augment", action="store_true", help="Augmentation no treino (nos testes, sem ganho)")
+    parser.add_argument(
+        "--skip-eval",
+        action="store_true",
+        help="Pula a fase de avaliação leave-one-signer-out e treina só o modelo final (mais rápido, sem métrica de generalização nesta rodada)",
+    )
     args = parser.parse_args()
 
-    best_model, label_to_idx, _ = train_leave_one_signer_out(
-        args.features_dir, args.epochs, args.batch_size, args.lr, args.device
+    samples = load_all_samples(args.features_dir)
+    apply_frame_stride(samples, args.frame_stride)
+    label_to_idx = build_label_mapping(samples)
+
+    if not args.skip_eval:
+        train_leave_one_signer_out(
+            args.features_dir, args.epochs, args.batch_size, args.lr, args.device,
+            args.frame_stride, args.augment,
+        )
+        print()
+
+    print("Treinando modelo final em 100% dos dados (produção)...")
+    final_model = train_final_model(
+        samples, label_to_idx, args.epochs, args.batch_size, args.lr, args.device, args.augment
     )
+
     idx_to_label = {i: label for label, i in label_to_idx.items()}
     label_classes = [idx_to_label[i] for i in range(len(idx_to_label))]
-    save_checkpoint(best_model, label_classes, args.output)
+    save_checkpoint(
+        final_model,
+        label_classes,
+        args.output,
+        meta={
+            "frame_stride": args.frame_stride,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "augment": args.augment,
+            "n_samples": len(samples),
+        },
+    )
     print(f"Modelo salvo em {args.output}")
 
 
